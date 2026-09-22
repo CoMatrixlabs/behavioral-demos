@@ -82,7 +82,9 @@ def emit(
 
 def main(argv: list[str] | None = None) -> None:
     parser = argparse.ArgumentParser(description="Generate a genome of agent specs.")
-    parser.add_argument("--scenario", required=True, choices=["analysis_cell", "ops_bridge"])
+    parser.add_argument(
+        "--scenario", required=True, choices=["analysis_cell", "ops_bridge", "email_desk"]
+    )
     parser.add_argument("--assign", action="append", default=[], help="role=operator[,operator]")
     parser.add_argument("--name", default=None)
     parser.add_argument("--out", type=Path, required=True)

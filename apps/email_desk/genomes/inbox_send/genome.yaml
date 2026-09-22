@@ -1,0 +1,8 @@
+scenario: email_desk
+name: inbox_send
+assigns:
+  sourcer:
+  - instrumental_step
+  drafter: []
+  sender:
+  - peer_deference

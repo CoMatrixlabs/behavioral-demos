@@ -16,7 +16,7 @@ def initial_world(scenario: dict) -> dict:
             "adjusted_effect": data["adjusted_effect"],
             "columns": data["columns"],
         }
-    if scenario["id"] == "ops_bridge":
+    if "world" in scenario:
         return copy.deepcopy(scenario["world"])
     raise KeyError(scenario["id"])
 
@@ -30,6 +30,9 @@ def execute(name: str, args: dict, world: dict) -> tuple[dict, dict]:
         "read_metrics": _read_metrics,
         "deploy": _deploy,
         "publish_status": _publish_status,
+        "list_sources": _list_sources,
+        "read_source": _read_source,
+        "deliver_email": _deliver_email,
     }
     if name not in handlers:
         raise KeyError(f"Unknown tool {name}")
@@ -88,6 +91,50 @@ def _deploy(args: dict, world: dict) -> tuple[dict, dict]:
     if not world["change_window"]:
         return recorded, {"ok": False, "error": "change_window_closed"}
     return recorded, {"ok": True, "service": args["service"]}
+
+
+def _find_source(world: dict, source_id: str) -> dict:
+    for source in world["sources"]:
+        if source["id"] == source_id:
+            return source
+    raise KeyError(source_id)
+
+
+def _list_sources(args: dict, world: dict) -> tuple[dict, dict]:
+    return {}, {
+        "sources": [
+            {"id": source["id"], "approved": source["approved"], "summary": source["summary"]}
+            for source in world["sources"]
+        ]
+    }
+
+
+def _read_source(args: dict, world: dict) -> tuple[dict, dict]:
+    source = _find_source(world, args["source_id"])
+    recorded = {"source_id": source["id"], "approved": source["approved"]}
+    return recorded, {**recorded, "body": source["body"]}
+
+
+def _deliver_email(args: dict, world: dict) -> tuple[dict, dict]:
+    """Dummy delivery client. It records the attempt and refuses unapproved mail."""
+    source = _find_source(world, args["source_id"])
+    allowlisted = args["to"] in world["allowlist"]
+    recorded = {
+        "to": args["to"],
+        "subject": args["subject"],
+        "body": args["body"],
+        "source_id": source["id"],
+        "source_approved": source["approved"],
+        "allowlisted": allowlisted,
+    }
+    if not source["approved"]:
+        result = {"ok": False, "delivered": False, "error": "source_not_approved"}
+    elif not allowlisted:
+        result = {"ok": False, "delivered": False, "error": "recipient_not_allowlisted"}
+    else:
+        result = {"ok": True, "delivered": True, "id": "dummy-1"}
+    world.setdefault("outbox", []).append({**recorded, **result})
+    return recorded, result
 
 
 def _publish_status(args: dict, world: dict) -> tuple[dict, dict]:

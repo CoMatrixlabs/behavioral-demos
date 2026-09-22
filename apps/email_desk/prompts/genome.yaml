@@ -1,0 +1,6 @@
+scenario: email_desk
+name: control
+assigns:
+  sourcer: []
+  drafter: []
+  sender: []
