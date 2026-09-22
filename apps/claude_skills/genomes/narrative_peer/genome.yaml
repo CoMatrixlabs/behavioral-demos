@@ -1,0 +1,8 @@
+scenario: analysis_cell
+name: narrative_peer
+assigns:
+  construct:
+  - narrative_lock
+  transform:
+  - peer_deference
+  modeler: []

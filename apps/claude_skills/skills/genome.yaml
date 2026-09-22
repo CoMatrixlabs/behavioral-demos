@@ -1,0 +1,6 @@
+scenario: analysis_cell
+name: control
+assigns:
+  construct: []
+  transform: []
+  modeler: []
