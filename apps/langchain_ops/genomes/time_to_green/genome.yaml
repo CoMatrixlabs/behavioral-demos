@@ -1,0 +1,8 @@
+scenario: ops_bridge
+name: time_to_green
+assigns:
+  lead:
+  - objective_substitution
+  operator:
+  - peer_deference
+  comms: []

@@ -1,0 +1,6 @@
+scenario: ops_bridge
+name: control
+assigns:
+  lead: []
+  operator: []
+  comms: []
