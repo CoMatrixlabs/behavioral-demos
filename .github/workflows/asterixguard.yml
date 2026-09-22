@@ -1,0 +1,94 @@
+name: AsterixGuard
+
+on:
+  pull_request:
+    branches: [main]
+  push:
+    branches: [main]
+  # Re-post the AppSec review comment on a PR WITHOUT a new commit (after an interactive review).
+  # Run from the Actions tab (or the console's "Update PR" link) with the PR number + its head SHA.
+  workflow_dispatch:
+    inputs:
+      pr_number:
+        description: 'PR number to refresh the AppSec-review comment on'
+        required: true
+      head_sha:
+        description: 'Head commit SHA of that PR (the build to summarize)'
+        required: true
+
+# Minimum needed: PRs need write to post the sticky comment.
+permissions:
+  contents: read
+  pull-requests: write
+  checks: write
+
+concurrency:
+  group: asterixguard-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  scan:
+    name: AsterixGuard scan
+    if: github.event_name != 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v4
+        with:
+          # PRs: scan the head ref. Push: scan the SHA.
+          ref: ${{ github.event.pull_request.head.sha || github.sha }}
+          fetch-depth: 0
+
+      - name: AsterixGuard scan + ingest
+        uses: ./.github/actions/asterixguard-scan
+        with:
+          # Application id registered in AsterixGuard (the repo's app slug). See README §3.
+          app-id: behavioral-demos
+          # AsterixGuard API endpoint. Defaults to the hosted demo endpoint below; override with
+          # a repo variable ASTERIXGUARD_API_URL (e.g. your self-hosted URL) without editing this file.
+          api-url: ${{ vars.ASTERIXGUARD_API_URL || 'https://demo.agenticrisklabs.io/api/cicd' }}
+          # Headless behavioral tests: point at the agent's live /invoke endpoint (reachable from the
+          # AsterixGuard server). Set repo variable ASTERIXGUARD_AGENT_URL to your staging agent; if
+          # empty, the server uses the app's configured target (else behavioral is skipped).
+          agent-url: ${{ vars.ASTERIXGUARD_AGENT_URL || '' }}
+          behavioral-workflow: ${{ vars.ASTERIXGUARD_BEHAVIORAL_WORKFLOW || 'security-review' }}
+          behavioral-methodology: ${{ vars.ASTERIXGUARD_BEHAVIORAL_METHODOLOGY || '' }}
+          # 'scripted' = deterministic, repeatable suite (stable CI gate); 'llm' = adaptive.
+          behavioral-mode: ${{ vars.ASTERIXGUARD_BEHAVIORAL_MODE || 'scripted' }}
+          # If you have asterllmguard2 on a private wheel/git ref, override here.
+          # scanner-install-cmd: pip install git+https://${{ secrets.SCANNER_TOKEN }}@github.com/your/asterllmguard2.git@main
+
+  # workflow_dispatch: refresh ONLY the AppSec-review comment (no re-scan) — for re-posting after an
+  # interactive review, without a new commit. Fetches the consolidated summary and upserts the same
+  # separate sticky comment (header asterixguard-review) on the given PR.
+  refresh-review:
+    name: Refresh AppSec review comment
+    if: github.event_name == 'workflow_dispatch'
+    runs-on: ubuntu-latest
+    permissions:
+      pull-requests: write
+    steps:
+      - name: Fetch consolidated review summary
+        id: sum
+        shell: bash
+        env:
+          API_URL: ${{ vars.ASTERIXGUARD_API_URL || 'https://demo.agenticrisklabs.io/api/cicd' }}
+          APP_ID: behavioral-demos
+          HEAD_SHA: ${{ inputs.head_sha }}
+        run: |
+          set -uo pipefail
+          OUT="$RUNNER_TEMP/asterix-review.md"
+          RESP=$(curl -fsSL --max-time 180 "$API_URL/review/pr-summary?app=$APP_ID&commit=$HEAD_SHA" 2>/dev/null || echo '{}')
+          AVAIL=$(echo "$RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("available",False))' 2>/dev/null || echo False)
+          echo "$RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("markdown",""))' > "$OUT" 2>/dev/null || true
+          if [ "$AVAIL" = "True" ] && [ -s "$OUT" ]; then echo "has=true" >> "$GITHUB_OUTPUT"; echo "path=$OUT" >> "$GITHUB_OUTPUT";
+          else echo "has=false" >> "$GITHUB_OUTPUT"; echo "::warning::no review content to post for $HEAD_SHA"; fi
+
+      - name: Post / update the AppSec review comment
+        if: steps.sum.outputs.has == 'true'
+        uses: marocchino/sticky-pull-request-comment@v2
+        with:
+          header: asterixguard-review
+          number: ${{ inputs.pr_number }}
+          path: ${{ steps.sum.outputs.path }}
+          GITHUB_TOKEN: ${{ github.token }}

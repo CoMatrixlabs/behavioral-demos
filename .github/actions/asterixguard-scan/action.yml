@@ -1,0 +1,280 @@
+name: 'AsterixGuard Scan'
+description: 'Run the real AsterixGuard pipeline on a PR diff, gate the merge, post a sticky PR comment.'
+author: 'Asterix'
+
+inputs:
+  app-id:
+    description: 'Application id registered in AsterixGuard (the repo''s app slug).'
+    required: true
+  api-url:
+    description: 'AsterixGuard API base URL (no trailing slash). Defaults to the hosted demo endpoint.'
+    required: false
+    default: 'https://demo.agenticrisklabs.io/api/cicd'
+  token:
+    description: 'Org scan token (sent as X-ARS-Token) when the instance enforces ingest auth. Optional against the open demo endpoint.'
+    required: false
+    default: ''
+  github-token:
+    description: 'GitHub token used to post the sticky PR comment.'
+    required: false
+    default: ${{ github.token }}
+  timeout-seconds:
+    description: 'How long to wait for the server-side scan to finish before falling back to the ingest verdict.'
+    required: false
+    default: '600'
+  agent-url:
+    description: 'Live /invoke endpoint of the agent under test, reachable from the AsterixGuard server. Set it (e.g. a repo/env variable ASTERIXGUARD_AGENT_URL pointing at your staging agent) to run behavioral tests headless in CI. If empty, the server uses the app''s configured target; if there is none, behavioral is skipped.'
+    required: false
+    default: ''
+  behavioral-workflow:
+    description: 'Workforce workflow for the behavioral run (appsec | security-review | compliance-audit | compliance-hipaa | design).'
+    required: false
+    default: 'security-review'
+  behavioral-methodology:
+    description: 'Optional methodology to force (e.g. context-injection for session-state / contextual-policy tests). Empty = auto from findings.'
+    required: false
+    default: ''
+  behavioral-timeout-seconds:
+    description: 'How long to wait for the headless behavioral run to finish.'
+    required: false
+    default: '600'
+  behavioral-mode:
+    description: 'Behavioral engine: "scripted" = a fixed, repeatable suite with deterministic oracles (stable CI gate); "llm" = the adaptive Attacker/Judge (richer, varies run-to-run).'
+    required: false
+    default: 'scripted'
+
+outputs:
+  gate:
+    description: 'Gate decision (ALLOWED / REVIEW_REQUIRED / BLOCKED) from the real scan.'
+    value: ${{ steps.realscan.outputs.gate || steps.ingest.outputs.gate }}
+  ars-score:
+    description: 'Numeric ARS score (0-100).'
+    value: ${{ steps.realscan.outputs.ars || steps.ingest.outputs.ars }}
+  veto:
+    description: 'Comma-separated list of veto rules fired (empty if none).'
+    value: ${{ steps.realscan.outputs.veto || steps.ingest.outputs.veto }}
+  dashboard-url:
+    description: 'Deep link into the AsterixGuard dashboard for this scan.'
+    value: ${{ steps.realscan.outputs.dashboard || steps.ingest.outputs.dashboard }}
+  scan-run-id:
+    description: 'Server-side scan_run_id (= job_id in the Jobs Timeline).'
+    value: ${{ steps.ingest.outputs.scan_run_id }}
+  behavioral-gate:
+    description: 'Behavioral gate from the headless workforce run (BLOCKED / REVIEW_REQUIRED / ALLOWED / SKIPPED).'
+    value: ${{ steps.behavioral.outputs.beh_gate }}
+  behavioral-summary:
+    description: 'Behavioral run summary (held/broke/inconclusive counts).'
+    value: ${{ steps.behavioral.outputs.beh_summary }}
+
+runs:
+  using: composite
+  steps:
+    # The AsterixGuard scanner is not run on the GH-hosted runner. Instead the runner registers the
+    # build and the SERVER runs the real asterllmguard2 pipeline on the PR diff (SAST · secrets · IaC
+    # · behavioral + the LLM/Presidio data-access model). The runner then polls for that real verdict
+    # and gates the merge on it. This keeps the scanner off untrusted runners and needs no private
+    # wheel, while still producing a genuine per-build result — not a stubbed verdict.
+    - name: Register build + trigger AsterixGuard scan
+      id: ingest
+      shell: bash
+      env:
+        APP_ID:  ${{ inputs.app-id }}
+        API_URL: ${{ inputs.api-url }}
+        ARS_TOKEN: ${{ inputs.token }}
+        PR_NUMBER: ${{ github.event.pull_request.number }}
+        PR_URL: ${{ github.event.pull_request.html_url }}
+      run: |
+        set -euo pipefail
+        API_URL="${API_URL:-https://demo.agenticrisklabs.io/api/cicd}"
+        export BRANCH="${GITHUB_HEAD_REF:-${GITHUB_REF_NAME}}"
+        export SHA="$GITHUB_SHA"
+        export AUTHOR="$GITHUB_ACTOR"
+        export REPO_NAME="${GITHUB_REPOSITORY##*/}"
+        export REPO_URL="${GITHUB_SERVER_URL}/${GITHUB_REPOSITORY}"
+        PR_NUMBER="${PR_NUMBER:-}"; PR_URL="${PR_URL:-}"
+
+        # JSON body via Python one-liner (no heredoc — heredocs break under YAML indentation).
+        BODY=$(python3 -c 'import json,os; print(json.dumps({"app_id":os.environ["APP_ID"],"repo_slug":os.environ["REPO_NAME"],"repo_url":os.environ["REPO_URL"],"branch":os.environ.get("BRANCH") or None,"commit_sha":os.environ["SHA"],"pr_number":int(os.environ["PR_NUMBER"]) if os.environ.get("PR_NUMBER") else None,"pr_url":os.environ.get("PR_URL") or None,"author_name":os.environ["AUTHOR"]}))')
+
+        HDR=(-H 'content-type: application/json')
+        [ -n "${ARS_TOKEN:-}" ] && HDR+=(-H "X-ARS-Token: ${ARS_TOKEN}")
+        echo "::group::POST $API_URL/scans/ingest"
+        RESP=$(curl -fsSL --max-time 120 -X POST "${API_URL}/scans/ingest" "${HDR[@]}" --data-binary "$BODY")
+        echo "$RESP" | python3 -m json.tool || true
+        echo "::endgroup::"
+        echo "$RESP" > "$RUNNER_TEMP/ingest-response.json"
+
+        pick(){ python3 -c "import json,sys;print(json.load(sys.stdin).get('$1',''))"; }
+        {
+          echo "gate=$(echo "$RESP" | pick gate_decision)"
+          echo "ars=$(echo "$RESP" | pick ars_score)"
+          echo "veto=$(echo "$RESP" | python3 -c 'import json,sys;print(",".join(json.load(sys.stdin).get("veto_fired",[]) or []))')"
+          echo "dashboard=$(echo "$RESP" | pick dashboard_url)"
+          echo "scan_run_id=$(echo "$RESP" | pick scan_run_id)"
+        } >> "$GITHUB_OUTPUT"
+
+    - name: Wait for the real scan + collect verdict
+      id: realscan
+      if: github.event_name == 'pull_request'
+      shell: bash
+      env:
+        APP_ID:  ${{ inputs.app-id }}
+        API_URL: ${{ inputs.api-url }}
+        ARS_TOKEN: ${{ inputs.token }}
+        TIMEOUT: ${{ inputs.timeout-seconds }}
+      run: |
+        set -uo pipefail
+        API_URL="${API_URL:-https://demo.agenticrisklabs.io/api/cicd}"
+        SHA="$GITHUB_SHA"; OUT="$RUNNER_TEMP/asterix-comment.md"
+        HDR=(); [ -n "${ARS_TOKEN:-}" ] && HDR+=(-H "X-ARS-Token: ${ARS_TOKEN}")
+        deadline=$(( $(date +%s) + ${TIMEOUT:-600} ))
+        GATE=""; ARS=""; VETO=""; DASH=""
+        echo "::group::Polling $API_URL/ci-review (server-side full pipeline)"
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+          RESP=$(curl -fsSL --max-time 30 "${HDR[@]}" "$API_URL/ci-review?app=$APP_ID&commit=$SHA" 2>/dev/null || echo '{}')
+          ST=$(echo "$RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("status",""))' 2>/dev/null || echo "")
+          echo "status=$ST"
+          if [ "$ST" = "done" ]; then
+            GATE=$(echo "$RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("gate_decision",""))')
+            ARS=$(echo "$RESP"  | python3 -c 'import json,sys;print(json.load(sys.stdin).get("ars_score",""))')
+            VETO=$(echo "$RESP" | python3 -c 'import json,sys;print(",".join(json.load(sys.stdin).get("veto_fired",[]) or []))')
+            DASH=$(echo "$RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("dashboard_url",""))')
+            echo "$RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("comment_markdown",""))' > "$OUT"
+            break
+          fi
+          [ "$ST" = "error" ] && { echo "::warning::server scan errored"; break; }
+          sleep 15
+        done
+        echo "::endgroup::"
+        if [ -z "$GATE" ]; then
+          echo "::warning::Real scan not ready within ${TIMEOUT}s — falling back to the ingest verdict."
+          GATE="${{ steps.ingest.outputs.gate }}"; ARS="${{ steps.ingest.outputs.ars }}"
+          VETO="${{ steps.ingest.outputs.veto }}"; DASH="${{ steps.ingest.outputs.dashboard }}"
+          python3 -c 'import json;print(json.load(open("'"$RUNNER_TEMP"'/ingest-response.json")).get("comment_markdown",""))' > "$OUT" || echo "AsterixGuard scan pending." > "$OUT"
+        fi
+        { echo "gate=$GATE"; echo "ars=$ARS"; echo "veto=$VETO"; echo "dashboard=$DASH"; echo "comment_path=$OUT"; } >> "$GITHUB_OUTPUT"
+
+    - name: Behavioral tests (headless workforce run)
+      id: behavioral
+      if: github.event_name == 'pull_request'
+      shell: bash
+      env:
+        APP_ID:  ${{ inputs.app-id }}
+        API_URL: ${{ inputs.api-url }}
+        ARS_TOKEN: ${{ inputs.token }}
+        AGENT_URL: ${{ inputs.agent-url }}
+        WF: ${{ inputs.behavioral-workflow }}
+        METH: ${{ inputs.behavioral-methodology }}
+        MODE: ${{ inputs.behavioral-mode }}
+        TIMEOUT: ${{ inputs.behavioral-timeout-seconds }}
+        COMMENT: ${{ steps.realscan.outputs.comment_path }}
+      run: |
+        set -uo pipefail
+        API_URL="${API_URL:-https://demo.agenticrisklabs.io/api/cicd}"
+        SHA="$GITHUB_SHA"
+        PHDR=(-H 'content-type: application/json'); [ -n "${ARS_TOKEN:-}" ] && PHDR+=(-H "X-ARS-Token: ${ARS_TOKEN}")
+        GHDR=(); [ -n "${ARS_TOKEN:-}" ] && GHDR+=(-H "X-ARS-Token: ${ARS_TOKEN}")
+        BODY=$(APP="$APP_ID" SHA="$SHA" python3 -c 'import json,os; b={"app":os.environ["APP"],"commit":os.environ["SHA"],"workflow":os.environ.get("WF") or "security-review","methodology":os.environ.get("METH") or "","mode":os.environ.get("MODE") or "scripted"}; au=os.environ.get("AGENT_URL"); b.update({"agent_url":au} if au else {}); print(json.dumps(b))')
+        echo "::group::POST $API_URL/workforce/run/start"
+        RESP=$(curl -fsSL --max-time 60 -X POST "$API_URL/workforce/run/start" "${PHDR[@]}" --data-binary "$BODY" || echo '{}')
+        JOB=$(echo "$RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("job_id",""))' 2>/dev/null || echo "")
+        echo "job_id=$JOB"; echo "::endgroup::"
+        if [ -z "$JOB" ]; then
+          echo "::warning::behavioral run not started (no live agent target configured for $APP_ID)"
+          echo "beh_gate=SKIPPED" >> "$GITHUB_OUTPUT"; exit 0
+        fi
+        deadline=$(( $(date +%s) + ${TIMEOUT:-600} )); DEC=""; SUM=""; BROKE=""
+        echo "::group::Polling behavioral run $JOB"
+        while [ "$(date +%s)" -lt "$deadline" ]; do
+          R=$(curl -fsSL --max-time 30 "${GHDR[@]}" "$API_URL/workforce/run/$JOB" 2>/dev/null || echo '{}')
+          ST=$(echo "$R" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("status",""))' 2>/dev/null || echo "")
+          echo "status=$ST"
+          if [ "$ST" = "done" ]; then
+            DEC=$(echo "$R" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("decision","") or "")')
+            SUM=$(echo "$R" | python3 -c 'import json,sys;d=json.load(sys.stdin).get("summary",{}) or {};print(", ".join(f"{k} {v}" for k,v in d.items()))')
+            BROKE=$(echo "$R" | python3 -c 'import json,sys;rows=json.load(sys.stdin).get("rows",[]) or [];print("; ".join(x.get("title","") for x in rows if x.get("status")=="failed")[:400])')
+            break
+          fi
+          [ "$ST" = "error" ] && { echo "::warning::behavioral run errored: $(echo "$R"|python3 -c 'import json,sys;print(json.load(sys.stdin).get("error",""))')"; break; }
+          sleep 12
+        done
+        echo "::endgroup::"
+        case "$DEC" in BLOCK) BG=BLOCKED;; REVIEW) BG=REVIEW_REQUIRED;; APPROVE) BG=ALLOWED;; *) BG=SKIPPED;; esac
+        echo "::notice title=AsterixGuard behavioral::$BG — ${SUM:-no result}"
+        { echo "beh_gate=$BG"; echo "beh_summary=$SUM"; } >> "$GITHUB_OUTPUT"
+        # append a behavioral section to the sticky PR comment
+        if [ -n "${COMMENT:-}" ] && [ "$BG" != "SKIPPED" ]; then
+          { echo ""; echo "### Behavioral tests (live agent · workforce)";
+            echo "- **Verdict:** \`$BG\`  ·  $SUM";
+            [ -n "$BROKE" ] && echo "- **Broke:** $BROKE"; } >> "$COMMENT"
+        fi
+
+    - name: Post sticky PR comment
+      if: github.event_name == 'pull_request'
+      uses: marocchino/sticky-pull-request-comment@v2
+      with:
+        header: asterixguard
+        path: ${{ steps.realscan.outputs.comment_path }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+
+    # The AppSec review runs AFTER the blocking scan: the security workforce consolidates the review's
+    # decision, remediation fixes, action items, tickets and comments into its OWN PR comment (separate
+    # sticky, header `asterixguard-review`). Posted before the gate step so it lands even when BLOCKED.
+    - name: AppSec review summary (fixes · tickets · comments)
+      id: review
+      if: github.event_name == 'pull_request'
+      shell: bash
+      env:
+        APP_ID:  ${{ inputs.app-id }}
+        API_URL: ${{ inputs.api-url }}
+        ARS_TOKEN: ${{ inputs.token }}
+      run: |
+        set -uo pipefail
+        API_URL="${API_URL:-https://demo.agenticrisklabs.io/api/cicd}"
+        SHA="$GITHUB_SHA"; OUT="$RUNNER_TEMP/asterix-review.md"
+        HDR=(); [ -n "${ARS_TOKEN:-}" ] && HDR+=(-H "X-ARS-Token: ${ARS_TOKEN}")
+        echo "::group::GET $API_URL/review/pr-summary"
+        RESP=$(curl -fsSL --max-time 180 "${HDR[@]}" "$API_URL/review/pr-summary?app=$APP_ID&commit=$SHA" 2>/dev/null || echo '{}')
+        AVAIL=$(echo "$RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("available",False))' 2>/dev/null || echo False)
+        echo "$RESP" | python3 -c 'import json,sys;print(json.load(sys.stdin).get("markdown",""))' > "$OUT" 2>/dev/null || true
+        echo "available=$AVAIL"; echo "::endgroup::"
+        if [ "$AVAIL" = "True" ] && [ -s "$OUT" ]; then
+          echo "has_review=true" >> "$GITHUB_OUTPUT"; echo "review_path=$OUT" >> "$GITHUB_OUTPUT"
+        else
+          echo "has_review=false" >> "$GITHUB_OUTPUT"
+        fi
+
+    - name: Post AppSec review comment (separate sticky)
+      if: github.event_name == 'pull_request' && steps.review.outputs.has_review == 'true'
+      uses: marocchino/sticky-pull-request-comment@v2
+      with:
+        header: asterixguard-review
+        path: ${{ steps.review.outputs.review_path }}
+        GITHUB_TOKEN: ${{ inputs.github-token }}
+
+    - name: Apply gate decision
+      shell: bash
+      env:
+        GATE: ${{ steps.realscan.outputs.gate || steps.ingest.outputs.gate }}
+        ARS:  ${{ steps.realscan.outputs.ars || steps.ingest.outputs.ars }}
+        VETO: ${{ steps.realscan.outputs.veto || steps.ingest.outputs.veto }}
+        BEH:  ${{ steps.behavioral.outputs.beh_gate }}
+        BEH_SUM: ${{ steps.behavioral.outputs.beh_summary }}
+        DASHBOARD: ${{ steps.realscan.outputs.dashboard || steps.ingest.outputs.dashboard }}
+      run: |
+        rank(){ case "$1" in BLOCKED) echo 3;; REVIEW_REQUIRED) echo 2;; ALLOWED) echo 1;; *) echo 0;; esac; }
+        # Final gate = worst of the scan gate and the headless behavioral gate.
+        FINAL="$GATE"
+        if [ -n "${BEH:-}" ] && [ "$BEH" != "SKIPPED" ] && [ "$(rank "$BEH")" -gt "$(rank "$FINAL")" ]; then FINAL="$BEH"; fi
+        echo "::notice title=AsterixGuard gate::scan=$GATE · behavioral=${BEH:-SKIPPED} (${BEH_SUM:-}) · final=$FINAL — ARS=$ARS — $DASHBOARD"
+        case "$FINAL" in
+          BLOCKED)
+            echo "::error title=AsterixGuard blocked the merge::scan=$GATE behavioral=${BEH:-} veto=${VETO:-see findings}. See $DASHBOARD"
+            exit 1 ;;
+          REVIEW_REQUIRED)
+            echo "::warning title=AsterixGuard requires review::ARS=$ARS · behavioral=${BEH:-}. See $DASHBOARD" ;;
+          ALLOWED)
+            echo "AsterixGuard allowed the change (ARS=$ARS · behavioral=${BEH:-SKIPPED})." ;;
+          *)
+            echo "::error title=Unknown gate state::'$FINAL'"; exit 2 ;;
+        esac
