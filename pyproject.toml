@@ -1,0 +1,25 @@
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "behavioral-demos"
+version = "0.1.0"
+description = "Multi-agent demos of autonomous decisions that fail a justifiable-action lattice."
+requires-python = ">=3.10"
+dependencies = [
+  "pyyaml>=6",
+  "langgraph>=0.2",
+  "langchain-core>=0.3",
+]
+
+[project.optional-dependencies]
+dev = ["pytest>=8"]
+live = ["anthropic>=0.40", "langchain-anthropic>=0.3"]
+
+[tool.setuptools.packages.find]
+include = ["corpus*", "apps*"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+pythonpath = ["."]
